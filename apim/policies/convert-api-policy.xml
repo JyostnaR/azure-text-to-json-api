@@ -1,0 +1,184 @@
+<!--
+    IMPORTANT: This policy applies specifically to the Convert Text to JSON API.
+    It includes Basic Authentication validation, request size limits, and error handling.
+-->
+<policies>
+    <inbound>
+        <!-- Basic Authentication Validation -->
+        <choose>
+            <when condition="@(!context.Request.Headers.ContainsKey("Authorization"))">
+                <return-response>
+                    <set-status code="401" reason="Unauthorized" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-header name="WWW-Authenticate" exists-action="override">
+                        <value>Basic realm="Text to JSON API"</value>
+                    </set-header>
+                    <set-body>{
+                        "error": "Unauthorized",
+                        "message": "Missing Authorization header. Please provide Basic Authentication credentials.",
+                        "correlationId": "@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))",
+                        "timestamp": "@(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))"
+                    }</set-body>
+                </return-response>
+            </when>
+            <otherwise>
+                <set-variable name="authHeader" value="@(context.Request.Headers.GetValueOrDefault("Authorization", ""))" />
+                <choose>
+                    <when condition="@(!context.Variables.GetValueOrDefault<string>("authHeader").StartsWith("Basic "))">
+                        <return-response>
+                            <set-status code="401" reason="Unauthorized" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-header name="WWW-Authenticate" exists-action="override">
+                                <value>Basic realm="Text to JSON API"</value>
+                            </set-header>
+                            <set-body>{
+                                "error": "Unauthorized",
+                                "message": "Invalid Authorization header format. Expected 'Basic <base64>'",
+                                "correlationId": "@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))",
+                                "timestamp": "@(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))"
+                            }</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+            </otherwise>
+        </choose>
+
+        <!-- Validate Content-Length -->
+        <choose>
+            <when condition="@(context.Request.Headers.ContainsKey("Content-Length"))">
+                <set-variable name="contentLength" value="@(Convert.ToInt64(context.Request.Headers.GetValueOrDefault("Content-Length", "0")))" />
+                <choose>
+                    <when condition="@(context.Variables.GetValueOrDefault<long>("contentLength") > 10485760)">
+                        <return-response>
+                            <set-status code="413" reason="Payload Too Large" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>{
+                                "error": "Payload Too Large",
+                                "message": "File size exceeds maximum allowed size of 10MB",
+                                "maxSizeBytes": 10485760,
+                                "correlationId": "@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))",
+                                "timestamp": "@(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))"
+                            }</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+            </when>
+        </choose>
+
+        <!-- Validate Content-Type -->
+        <choose>
+            <when condition="@(!context.Request.Headers.GetValueOrDefault("Content-Type", "").Contains("multipart/form-data"))">
+                <return-response>
+                    <set-status code="400" reason="Bad Request" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>{
+                        "error": "Bad Request",
+                        "message": "Content-Type must be 'multipart/form-data' for file uploads",
+                        "correlationId": "@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))",
+                        "timestamp": "@(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))"
+                    }</set-body>
+                </return-response>
+            </when>
+        </choose>
+
+        <!-- Add API-specific headers -->
+        <set-header name="X-API-Version" exists-action="override">
+            <value>1.0</value>
+        </set-header>
+        
+        <!-- Log API-specific information -->
+        <log-to-eventhub logger-id="txt2json-logger">
+            API: Convert Text to JSON
+            Method: <@(context.Request.Method)>
+            URL: <@(context.Request.Url.ToString())>
+            Auth Header Present: <@(context.Request.Headers.ContainsKey("Authorization"))>
+            Content Type: <@(context.Request.Headers.GetValueOrDefault("Content-Type", "N/A"))>
+            Content Length: <@(context.Request.Headers.GetValueOrDefault("Content-Length", "0"))>
+            User Agent: <@(context.Request.Headers.GetValueOrDefault("User-Agent", "N/A"))>
+            Client IP: <@(context.Request.Headers.GetValueOrDefault("X-Forwarded-For", "N/A"))>
+        </log-to-eventhub>
+
+        <!-- Set backend URL -->
+        <set-backend-service base-url="@{
+            var functionAppName = "txt2json-dev-{unique-suffix}-func";
+            return $"https://{functionAppName}.azurewebsites.net";
+        }" />
+    </inbound>
+    
+    <backend>
+        <!-- Forward request to Azure Function -->
+        <forward-request />
+    </backend>
+    
+    <outbound>
+        <!-- Add API version to response -->
+        <set-header name="X-API-Version" exists-action="override">
+            <value>1.0</value>
+        </set-header>
+        
+        <!-- Log response information -->
+        <log-to-eventhub logger-id="txt2json-logger">
+            API Response Status: <@(context.Response.StatusCode)>
+            Response Time: <@(context.Elapsed)>
+            Response Size: <@(context.Response.Body.As<string>().Length)>
+            Correlation ID: <@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))>
+        </log-to-eventhub>
+
+        <!-- Ensure proper content type for successful responses -->
+        <choose>
+            <when condition="@(context.Response.StatusCode == 200)">
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+            </when>
+        </choose>
+
+        <!-- Add CORS headers for browser compatibility -->
+        <set-header name="Access-Control-Allow-Origin" exists-action="override">
+            <value>*</value>
+        </set-header>
+        <set-header name="Access-Control-Allow-Methods" exists-action="override">
+            <value>POST, OPTIONS</value>
+        </set-header>
+        <set-header name="Access-Control-Allow-Headers" exists-action="override">
+            <value>Authorization, Content-Type, X-Correlation-ID</value>
+        </set-header>
+    </outbound>
+    
+    <on-error>
+        <!-- Log error details -->
+        <log-to-eventhub logger-id="txt2json-logger">
+            API Error: <@(context.LastError.Message)>
+            Source: <@(context.LastError.Source)>
+            Reason: <@(context.LastError.Reason)>
+            Status Code: <@(context.Response.StatusCode)>
+            Correlation ID: <@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))>
+            Timestamp: <@(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))>
+        </log-to-eventhub>
+
+        <!-- Return consistent error format -->
+        <return-response>
+            <set-status code="@(context.Response.StatusCode)" reason="@(context.Response.StatusReason)" />
+            <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+            </set-header>
+            <set-header name="X-Correlation-ID" exists-action="override">
+                <value>@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))</value>
+            </set-header>
+            <set-body>{
+                "error": "@(context.LastError.Message)",
+                "message": "@(context.LastError.Reason)",
+                "correlationId": "@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))",
+                "timestamp": "@(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))"
+            }</set-body>
+        </return-response>
+    </on-error>
+</policies>

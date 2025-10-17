@@ -1,0 +1,10 @@
+Line 1: This is the first line of the sample text file.
+Line 2: This line contains some numbers: 123, 456, 789.
+Line 3: This line has special characters: @#$%^&*()_+-=[]{}|;':\",./<>?
+Line 4: This is a longer line that demonstrates how the API handles text content with multiple words and various punctuation marks.
+Line 5: The API converts each line into a structured JSON object with metadata.
+Line 6: Each JSON object includes line number, content, length, word count, and timestamp.
+Line 7: This sample file is used for testing the Text to JSON conversion functionality.
+Line 8: The API supports files up to 10MB in size with proper authentication.
+Line 9: All requests are logged to Application Insights for monitoring and debugging.
+Line 10: This is the final line of the sample text file.
