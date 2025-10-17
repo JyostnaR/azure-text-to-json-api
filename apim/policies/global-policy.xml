@@ -1,0 +1,144 @@
+<!--
+    IMPORTANT: This policy contains a global policy that applies to all operations.
+    It includes CORS configuration, basic security headers, and request/response logging.
+-->
+<policies>
+    <inbound>
+        <!-- CORS Configuration -->
+        <cors allow-credentials="true">
+            <allowed-origins>
+                <origin>*</origin>
+            </allowed-origins>
+            <allowed-methods>
+                <method>GET</method>
+                <method>POST</method>
+                <method>PUT</method>
+                <method>DELETE</method>
+                <method>OPTIONS</method>
+            </allowed-methods>
+            <allowed-headers>
+                <header>Authorization</header>
+                <header>Content-Type</header>
+                <header>X-Requested-With</header>
+                <header>Accept</header>
+                <header>Origin</header>
+            </allowed-headers>
+        </cors>
+
+        <!-- Security Headers -->
+        <set-header name="X-Content-Type-Options" exists-action="override">
+            <value>nosniff</value>
+        </set-header>
+        <set-header name="X-Frame-Options" exists-action="override">
+            <value>DENY</value>
+        </set-header>
+        <set-header name="X-XSS-Protection" exists-action="override">
+            <value>1; mode=block</value>
+        </set-header>
+        <set-header name="Strict-Transport-Security" exists-action="override">
+            <value>max-age=31536000; includeSubDomains</value>
+        </set-header>
+
+        <!-- Rate Limiting -->
+        <rate-limit calls="100" renewal-period="60" />
+        
+        <!-- Request Logging -->
+        <log-to-eventhub logger-id="txt2json-logger">
+            <@(context.Request.Headers.GetValueOrDefault("Authorization", "N/A"))>
+            <@(context.Request.Url.ToString())>
+            <@(context.Request.Method)>
+            <@(context.Request.Headers.GetValueOrDefault("Content-Type", "N/A"))>
+            <@(context.Request.Headers.GetValueOrDefault("Content-Length", "0"))>
+            <@(context.Request.Headers.GetValueOrDefault("User-Agent", "N/A"))>
+            <@(context.Request.Headers.GetValueOrDefault("X-Forwarded-For", "N/A"))>
+        </log-to-eventhub>
+
+        <!-- Add Correlation ID if not present -->
+        <choose>
+            <when condition="@(!context.Request.Headers.ContainsKey("X-Correlation-ID"))">
+                <set-header name="X-Correlation-ID" exists-action="override">
+                    <value>@(Guid.NewGuid().ToString())</value>
+                </set-header>
+            </when>
+        </choose>
+
+        <!-- Validate Content-Type for POST requests -->
+        <choose>
+            <when condition="@(context.Request.Method == "POST")">
+                <choose>
+                    <when condition="@(!context.Request.Headers.GetValueOrDefault("Content-Type", "").Contains("multipart/form-data"))">
+                        <return-response>
+                            <set-status code="400" reason="Bad Request" />
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body>{
+                                "error": "Bad Request",
+                                "message": "Content-Type must be 'multipart/form-data' for file uploads",
+                                "correlationId": "@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))",
+                                "timestamp": "@(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))"
+                            }</set-body>
+                        </return-response>
+                    </when>
+                </choose>
+            </when>
+        </choose>
+    </inbound>
+    
+    <backend>
+        <!-- Forward all requests to the backend -->
+    </backend>
+    
+    <outbound>
+        <!-- Response Logging -->
+        <log-to-eventhub logger-id="txt2json-logger">
+            Response Status: <@(context.Response.StatusCode)>
+            Response Time: <@(context.Elapsed)>
+            Correlation ID: <@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))>
+        </log-to-eventhub>
+
+        <!-- Add security headers to response -->
+        <set-header name="X-Content-Type-Options" exists-action="override">
+            <value>nosniff</value>
+        </set-header>
+        <set-header name="X-Frame-Options" exists-action="override">
+            <value>DENY</value>
+        </set-header>
+        <set-header name="X-XSS-Protection" exists-action="override">
+            <value>1; mode=block</value>
+        </set-header>
+        
+        <!-- Forward correlation ID from request to response -->
+        <set-header name="X-Correlation-ID" exists-action="override">
+            <value>@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))</value>
+        </set-header>
+    </outbound>
+    
+    <on-error>
+        <!-- Error Logging -->
+        <log-to-eventhub logger-id="txt2json-logger">
+            Error: <@(context.LastError.Message)>
+            Source: <@(context.LastError.Source)>
+            Reason: <@(context.LastError.Reason)>
+            Correlation ID: <@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))>
+            Timestamp: <@(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))>
+        </log-to-eventhub>
+
+        <!-- Return consistent error format -->
+        <return-response>
+            <set-status code="500" reason="Internal Server Error" />
+            <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+            </set-header>
+            <set-header name="X-Correlation-ID" exists-action="override">
+                <value>@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))</value>
+            </set-header>
+            <set-body>{
+                "error": "Internal Server Error",
+                "message": "An unexpected error occurred while processing your request",
+                "correlationId": "@(context.Request.Headers.GetValueOrDefault("X-Correlation-ID", ""))",
+                "timestamp": "@(DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"))"
+            }</set-body>
+        </return-response>
+    </on-error>
+</policies>

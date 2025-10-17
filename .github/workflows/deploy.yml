@@ -1,0 +1,354 @@
+name: Deploy Azure Text to JSON API
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'src/**'
+      - 'infrastructure/**'
+      - '.github/workflows/deploy.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'infrastructure/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - staging
+        - prod
+      deploy_infrastructure:
+        description: 'Deploy infrastructure'
+        required: true
+        default: false
+        type: boolean
+      deploy_function:
+        description: 'Deploy function app'
+        required: true
+        default: true
+        type: boolean
+
+env:
+  AZURE_FUNCTIONAPP_PACKAGE_PATH: './src/Txt2JsonFunction'
+  DOTNET_VERSION: '8.0.x'
+
+jobs:
+  # Build and Test Job
+  build-and-test:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+      deploy-infrastructure: ${{ steps.set-env.outputs.deploy-infrastructure }}
+      deploy-function: ${{ steps.set-env.outputs.deploy-function }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+
+    - name: Set environment variables
+      id: set-env
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          echo "deploy-infrastructure=${{ github.event.inputs.deploy_infrastructure }}" >> $GITHUB_OUTPUT
+          echo "deploy-function=${{ github.event.inputs.deploy_function }}" >> $GITHUB_OUTPUT
+        else
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "environment=prod" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          else
+            echo "environment=dev" >> $GITHUB_OUTPUT
+          fi
+          echo "deploy-infrastructure=true" >> $GITHUB_OUTPUT
+          echo "deploy-function=true" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Restore dependencies
+      run: dotnet restore ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+
+    - name: Build project
+      run: dotnet build ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }} --configuration Release --no-restore
+
+    - name: Run tests
+      run: |
+        find . -name "*.Tests.csproj" -exec dotnet test {} --configuration Release --no-build --verbosity normal \;
+
+    - name: Publish project
+      run: dotnet publish ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }} --configuration Release --output ./publish --no-build
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: function-app-${{ steps.set-env.outputs.environment }}
+        path: ./publish
+
+  # Infrastructure Deployment Job
+  deploy-infrastructure:
+    needs: build-and-test
+    if: needs.build-and-test.outputs.deploy-infrastructure == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.build-and-test.outputs.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Set environment variables
+      run: |
+        echo "RESOURCE_GROUP_NAME=rg-txt2json-${{ needs.build-and-test.outputs.environment }}" >> $GITHUB_ENV
+        echo "DEPLOYMENT_NAME=txt2json-deployment-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
+        echo "LOCATION=eastus" >> $GITHUB_ENV
+
+    - name: Deploy Bicep template
+      run: |
+        az deployment group create \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --name ${{ env.DEPLOYMENT_NAME }} \
+          --template-file ./infrastructure/main.bicep \
+          --parameters ./infrastructure/parameters.json \
+          --parameters environment=${{ needs.build-and-test.outputs.environment }} \
+          --output table
+
+    - name: Get deployment outputs
+      id: get-outputs
+      run: |
+        FUNCTION_APP_NAME=$(az deployment group show \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --name ${{ env.DEPLOYMENT_NAME }} \
+          --query "properties.outputs.functionAppName.value" \
+          --output tsv)
+        
+        APIM_NAME=$(az deployment group show \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --name ${{ env.DEPLOYMENT_NAME }} \
+          --query "properties.outputs.apiManagementName.value" \
+          --output tsv)
+        
+        KEY_VAULT_NAME=$(az deployment group show \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --name ${{ env.DEPLOYMENT_NAME }} \
+          --query "properties.outputs.keyVaultName.value" \
+          --output tsv)
+        
+        echo "function-app-name=$FUNCTION_APP_NAME" >> $GITHUB_OUTPUT
+        echo "apim-name=$APIM_NAME" >> $GITHUB_OUTPUT
+        echo "key-vault-name=$KEY_VAULT_NAME" >> $GITHUB_OUTPUT
+
+    - name: Create sample secrets in Key Vault
+      run: |
+        az keyvault secret set \
+          --vault-name ${{ steps.get-outputs.outputs.key-vault-name }} \
+          --name "api-username" \
+          --value "apiuser" \
+          --output none
+        
+        az keyvault secret set \
+          --vault-name ${{ steps.get-outputs.outputs.key-vault-name }} \
+          --name "api-password" \
+          --value "SecurePassword123!" \
+          --output none
+
+    - name: Save deployment outputs
+      run: |
+        echo "Function App: ${{ steps.get-outputs.outputs.function-app-name }}" >> $GITHUB_STEP_SUMMARY
+        echo "API Management: ${{ steps.get-outputs.outputs.apim-name }}" >> $GITHUB_STEP_SUMMARY
+        echo "Key Vault: ${{ steps.get-outputs.outputs.key-vault-name }}" >> $GITHUB_STEP_SUMMARY
+
+  # Function App Deployment Job
+  deploy-function-app:
+    needs: [build-and-test, deploy-infrastructure]
+    if: needs.build-and-test.outputs.deploy-function == 'true' && always() && (needs.deploy-infrastructure.result == 'success' || needs.deploy-infrastructure.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: ${{ needs.build-and-test.outputs.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: function-app-${{ needs.build-and-test.outputs.environment }}
+
+    - name: Set environment variables
+      run: |
+        echo "RESOURCE_GROUP_NAME=rg-txt2json-${{ needs.build-and-test.outputs.environment }}" >> $GITHUB_ENV
+        echo "DEPLOYMENT_NAME=txt2json-deployment-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_ENV
+
+    - name: Get Function App name
+      id: get-function-app
+      run: |
+        DEPLOYMENT_NAME=$(az deployment group list \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --query "[0].name" \
+          --output tsv)
+        
+        FUNCTION_APP_NAME=$(az deployment group show \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --name $DEPLOYMENT_NAME \
+          --query "properties.outputs.functionAppName.value" \
+          --output tsv)
+        
+        echo "function-app-name=$FUNCTION_APP_NAME" >> $GITHUB_OUTPUT
+
+    - name: Deploy Function App
+      uses: Azure/functions-action@v1
+      with:
+        app-name: ${{ steps.get-function-app.outputs.function-app-name }}
+        package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+        publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
+
+    - name: Verify deployment
+      run: |
+        echo "Function App deployed successfully: ${{ steps.get-function-app.outputs.function-app-name }}" >> $GITHUB_STEP_SUMMARY
+        echo "Function URL: https://${{ steps.get-function-app.outputs.function-app-name }}.azurewebsites.net" >> $GITHUB_STEP_SUMMARY
+
+  # API Management Configuration Job
+  configure-apim:
+    needs: [deploy-infrastructure, deploy-function-app]
+    if: always() && needs.deploy-infrastructure.result == 'success' && needs.deploy-function-app.result == 'success'
+    runs-on: ubuntu-latest
+    environment: ${{ needs.build-and-test.outputs.environment }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Azure Login
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    - name: Set environment variables
+      run: |
+        echo "RESOURCE_GROUP_NAME=rg-txt2json-${{ needs.build-and-test.outputs.environment }}" >> $GITHUB_ENV
+
+    - name: Get deployment outputs
+      id: get-deployment-outputs
+      run: |
+        DEPLOYMENT_NAME=$(az deployment group list \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --query "[0].name" \
+          --output tsv)
+        
+        APIM_NAME=$(az deployment group show \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --name $DEPLOYMENT_NAME \
+          --query "properties.outputs.apiManagementName.value" \
+          --output tsv)
+        
+        FUNCTION_APP_URL=$(az deployment group show \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --name $DEPLOYMENT_NAME \
+          --query "properties.outputs.functionAppUrl.value" \
+          --output tsv)
+        
+        echo "apim-name=$APIM_NAME" >> $GITHUB_OUTPUT
+        echo "function-app-url=$FUNCTION_APP_URL" >> $GITHUB_OUTPUT
+
+    - name: Configure APIM API
+      run: |
+        # Create API
+        az apim api create \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --service-name ${{ steps.get-deployment-outputs.outputs.apim-name }} \
+          --api-id "convert-text-to-json" \
+          --display-name "Convert Text to JSON API" \
+          --description "REST API that converts text files to JSON format with Basic Authentication" \
+          --path "convert" \
+          --service-url ${{ steps.get-deployment-outputs.outputs.function-app-url }} \
+          --protocols https \
+          --subscription-required true \
+          --output table
+
+    - name: Add API Operation
+      run: |
+        az apim api operation create \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --service-name ${{ steps.get-deployment-outputs.outputs.apim-name }} \
+          --api-id "convert-text-to-json" \
+          --operation-id "convert-text-to-json" \
+          --display-name "Convert Text to JSON" \
+          --method POST \
+          --url-template "/v1/convert/text-to-json" \
+          --description "Converts uploaded text file to structured JSON format" \
+          --output table
+
+    - name: Apply APIM Policies
+      run: |
+        # Apply operation policy
+        az apim api operation policy create \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --service-name ${{ steps.get-deployment-outputs.outputs.apim-name }} \
+          --api-id "convert-text-to-json" \
+          --operation-id "convert-text-to-json" \
+          --policy-file "./apim/policies/convert-api-policy.xml" \
+          --output table
+
+    - name: Create APIM Subscription
+      run: |
+        az apim subscription create \
+          --resource-group ${{ env.RESOURCE_GROUP_NAME }} \
+          --service-name ${{ steps.get-deployment-outputs.outputs.apim-name }} \
+          --subscription-id "txt2json-subscription" \
+          --display-name "Text to JSON API Subscription" \
+          --scope "/apis/convert-text-to-json" \
+          --output table
+
+    - name: Get APIM URL
+      id: get-apim-url
+      run: |
+        APIM_URL="https://${{ steps.get-deployment-outputs.outputs.apim-name }}.azure-api.net"
+        echo "apim-url=$APIM_URL" >> $GITHUB_OUTPUT
+
+    - name: Save APIM configuration
+      run: |
+        echo "## API Management Configuration" >> $GITHUB_STEP_SUMMARY
+        echo "APIM Instance: ${{ steps.get-deployment-outputs.outputs.apim-name }}" >> $GITHUB_STEP_SUMMARY
+        echo "API URL: ${{ steps.get-apim-url.outputs.apim-url }}/convert/v1/convert/text-to-json" >> $GITHUB_STEP_SUMMARY
+        echo "Method: POST" >> $GITHUB_STEP_SUMMARY
+        echo "Content-Type: multipart/form-data" >> $GITHUB_STEP_SUMMARY
+
+  # Notification Job
+  notify:
+    needs: [build-and-test, deploy-infrastructure, deploy-function-app, configure-apim]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Deployment Status
+      run: |
+        echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "Environment: ${{ needs.build-and-test.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+        echo "Build and Test: ${{ needs.build-and-test.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "Infrastructure: ${{ needs.deploy-infrastructure.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "Function App: ${{ needs.deploy-function-app.result }}" >> $GITHUB_STEP_SUMMARY
+        echo "API Management: ${{ needs.configure-apim.result }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ needs.configure-apim.result }}" = "success" ]; then
+          echo "✅ Deployment completed successfully!" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ Deployment failed or was skipped." >> $GITHUB_STEP_SUMMARY
+        fi
